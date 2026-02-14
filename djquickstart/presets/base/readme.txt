@@ -1,0 +1,1 @@
+This is my go-to barebones preset, which sets up python-dotenv, PostgreSQL connection and a couple other essential settings for development.

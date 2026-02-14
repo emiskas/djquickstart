@@ -1,0 +1,9 @@
+[project]
+name = "djquickstart"
+version = "0.1.1"
+description = "CLI tool for fast Django project setup"
+authors = [{name="You"}]
+dependencies = ["click", "Django"]
+
+[project.scripts]
+djquickstart = "djquickstart.cli:cli"
