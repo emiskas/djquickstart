@@ -55,11 +55,11 @@ def cli():
 
 @cli.command()
 @click.argument("project_name")
-@click.argument("app_name")
+@click.argument("app_name", required=False)
 @click.option("--preset", default="base", help="Choose project preset")
 @click.option("--install", is_flag=True, help="Install dependencies automatically")
 def project(project_name, app_name, preset, install):
-    """Create Django project and app with chosen preset."""
+    """Create Django project or copy preset project."""
     click.echo(f"Starting Django project '{project_name}' with preset '{preset}'")
 
     preset_path = PRESETS_DIR / preset
@@ -67,11 +67,7 @@ def project(project_name, app_name, preset, install):
         click.echo(f"Preset '{preset}' not found.")
         raise SystemExit(1)
 
-    # Clean names for Python imports
     safe_project_name = project_name.replace("-", "_")
-    safe_app_name = app_name.replace("-", "_")
-
-    # 1. Determine where the project will live
     project_root = Path.cwd() / project_name
 
     if project_root.exists() and any(project_root.iterdir()):
@@ -80,53 +76,117 @@ def project(project_name, app_name, preset, install):
 
     project_root.mkdir(exist_ok=True)
 
-    # 2. Run django-admin inside that directory (flat layout)
-    subprocess.run(
-        ["django-admin", "startproject", safe_project_name, "."],
-        check=True,
-        cwd=project_root,
-    )
+    # Detect if this preset is a full Django project
+    is_full_project = (preset_path / "manage.py").exists()
 
-    inner_project_path = project_root / safe_project_name
+    if is_full_project:
+        # Copy entire preset project
+        shutil.copytree(preset_path, project_root, dirs_exist_ok=True)
 
-    # 3. Copy custom preset settings.py INTO the inner project folder (if provided)
-    src_settings = preset_path / "settings.py"
-    target_settings = inner_project_path / "settings.py"
+        # Dynamically find the folder containing settings.py
+        inner_project_dirs = [
+            d for d in project_root.iterdir() if (d / "settings.py").exists()
+        ]
+        if not inner_project_dirs:
+            raise SystemExit(f"No settings.py found in preset '{preset}'")
+        inner_project_path = inner_project_dirs[0]
+        target_settings = inner_project_path / "settings.py"
 
-    if src_settings.exists():
-        shutil.copy(src_settings, target_settings)
+        # Rename inner folder to match new project name
+        new_inner_path = project_root / safe_project_name
+        if inner_project_path.name != safe_project_name:
+            inner_project_path.rename(new_inner_path)
+            inner_project_path = new_inner_path
+            target_settings = inner_project_path / "settings.py"
 
-        # Fix project references inside the preset settings
+        # Patch settings.py references
         fix_project_references(target_settings, safe_project_name)
 
-    # 4. Create the app inside the project
-    subprocess.run(
-        ["python", "manage.py", "startapp", safe_app_name],
-        check=True,
-        cwd=project_root,
-    )
+        # patch wsgi/asgi
+        for file_name in ["wsgi.py", "asgi.py"]:
+            file_path = inner_project_path / file_name
+            if file_path.exists():
+                text = file_path.read_text()
+                text = text.replace(
+                    'os.environ.setdefault("DJANGO_SETTINGS_MODULE", "barber.settings")',
+                    f'os.environ.setdefault("DJANGO_SETTINGS_MODULE", "{safe_project_name}.settings")',
+                )
+                file_path.write_text(text)
 
-    # 5. Now safely add app to INSTALLED_APPS
-    add_app_to_settings(target_settings, safe_app_name)
+        # patch manage.py
+        manage_path = project_root / "manage.py"
+        if manage_path.exists():
+            text = manage_path.read_text()
+            text = text.replace(
+                'os.environ.setdefault("DJANGO_SETTINGS_MODULE", "barber.settings")',
+                f'os.environ.setdefault("DJANGO_SETTINGS_MODULE", "{safe_project_name}.settings")',
+            )
+            manage_path.write_text(text)
+    else:
+        # Standard startproject flow
+        subprocess.run(
+            ["django-admin", "startproject", safe_project_name, "."],
+            check=True,
+            cwd=project_root,
+        )
+        inner_project_path = project_root / safe_project_name
 
-    # 6. Copy remaining preset files (requirements.txt only)
+        # Copy preset settings.py if exists
+        src_settings = preset_path / "settings.py"
+        target_settings = inner_project_path / "settings.py"
+        if src_settings.exists():
+            shutil.copy(src_settings, target_settings)
+            fix_project_references(target_settings, safe_project_name)
+
+    # SECRET_KEY handling
+    env_file = None
+    for candidate in [".env.template", ".env"]:
+        path = preset_path / candidate
+        if path.exists():
+            env_file = path
+            break
+
+    if env_file:
+        content = env_file.read_text().replace("{{SECRET_KEY}}", get_random_secret_key())
+        (project_root / ".env").write_text(content)
+        click.echo(f"Created .env from preset template: {env_file.name}")
+
+        # Delete the copied template from the project
+        copied_template = project_root / env_file.name
+        if copied_template.exists():
+            try:
+                copied_template.unlink()
+                click.echo(f"Removed template from project: {copied_template.name}")
+            except Exception as e:
+                click.echo(f"Could not remove template from project: {copied_template} ({e})")
+
+    else:
+        # fallback: patch settings.py directly
+        text = target_settings.read_text()
+        text = re.sub(
+            r'SECRET_KEY\s*=\s*["\'].*?["\']',
+            f'SECRET_KEY = "{get_random_secret_key()}"',
+            text,
+        )
+        target_settings.write_text(text)
+
+    # App creation: skipped for full project presets
+    if not is_full_project and app_name:
+        safe_app_name = app_name.replace("-", "_")
+        subprocess.run(
+            ["python", "manage.py", "startapp", safe_app_name],
+            check=True,
+            cwd=project_root,
+        )
+        add_app_to_settings(target_settings, safe_app_name)
+
+    # Copy allowed preset files (requirements.txt)
     ALLOWED_PRESET_FILES = {"requirements.txt"}
     for file in preset_path.iterdir():
-        if file.name not in ALLOWED_PRESET_FILES:
-            continue
-        shutil.copy(file, project_root / file.name)
+        if file.name in ALLOWED_PRESET_FILES:
+            shutil.copy(file, project_root / file.name)
 
-    # 7. Handle .env.template → .env with SECRET_KEY
-    template_env = preset_path / ".env.template"
-    env_path = project_root / ".env"
-
-    if template_env.exists():
-        content = template_env.read_text().replace(
-            "{{SECRET_KEY}}", get_random_secret_key()
-        )
-        env_path.write_text(content)
-
-    # 8. Optionally install dependencies
+    # Optionally install dependencies
     if install:
         subprocess.run(
             ["pip", "install", "-r", "requirements.txt"],
@@ -134,8 +194,7 @@ def project(project_name, app_name, preset, install):
             cwd=project_root,
         )
 
-    click.echo(f"Project '{project_name}' with app '{app_name}' is ready.")
+    click.echo(f"Project '{project_name}' is ready.")
 
 
-if __name__ == "__main__":
-    cli()
+cli()
